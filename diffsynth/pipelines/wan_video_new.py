@@ -78,6 +78,8 @@ class WanVideoPipeline(BasePipeline):
         timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
         timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
         
+        #print(f"Shape of inputs['input_latents']: {inputs['input_latents'].shape}")
+        #print(f"Shape of inputs['noise']: {inputs['noise'].shape}")
         inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
         

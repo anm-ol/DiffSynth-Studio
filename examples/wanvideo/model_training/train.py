@@ -20,14 +20,17 @@ class WanTrainingModule(DiffusionTrainingModule):
         super().__init__()
         # Load models
         model_configs = []
+        tokenizer_config = ModelConfig(path="./models/VACE1.3/google/umt5-xxl")
         if model_paths is not None:
             model_paths = json.loads(model_paths)
             model_configs += [ModelConfig(path=path) for path in model_paths]
         if model_id_with_origin_paths is not None:
             model_id_with_origin_paths = model_id_with_origin_paths.split(",")
             model_configs += [ModelConfig(model_id=i.split(":")[0], origin_file_pattern=i.split(":")[1]) for i in model_id_with_origin_paths]
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs)
-        
+        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs, tokenizer_config=tokenizer_config)
+        print(f"Loaded VACE MODEL FINALLY model configs.")
+        #self.pipe.to("cuda")
+        print(f"Loaded VACE MODEL FINALLY to {self.pipe.device}.")
         # Reset training scheduler
         self.pipe.scheduler.set_timesteps(1000, training=True)
         
@@ -90,7 +93,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         
         # Pipeline units will automatically process the input parameters.
         for unit in self.pipe.units:
-            inputs_shared, inputs_posi, inputs_nega = self.pipe.unit_runner(unit, self.pipe, inputs_shared, inputs_posi, inputs_nega)
+            inputs_shared, inputs_posi, inputs_nega = self.pipe.unit_runner(unit, self.pipe, inputs_shared, inputs_posi, inputs_nega) # type: ignore
         return {**inputs_shared, **inputs_posi}
     
     
@@ -114,8 +117,8 @@ if __name__ == "__main__":
         lora_rank=args.lora_rank,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
-        max_timestep_boundary=args.max_timestep_boundary,
-        min_timestep_boundary=args.min_timestep_boundary,
+        max_timestep_boundary=1.0,
+        min_timestep_boundary=0.0,
     )
     model_logger = ModelLogger(
         args.output_path,
@@ -123,6 +126,7 @@ if __name__ == "__main__":
     )
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    print(f"Starting training with {len(dataset)} samples.")
     launch_training_task(
         dataset, model, model_logger, optimizer, scheduler,
         num_epochs=args.num_epochs,
