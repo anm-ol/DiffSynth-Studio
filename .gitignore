@@ -7,3 +7,9 @@ data
 *.jpeg
 *.gif
 models/VACE1.3/*
+wandb/*
+*.ckpt
+*.pth
+*.err
+*.log
+*.out

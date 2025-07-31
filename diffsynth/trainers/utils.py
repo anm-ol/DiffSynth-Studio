@@ -4,6 +4,12 @@ from PIL import Image
 import pandas as pd
 from tqdm import tqdm
 from accelerate import Accelerator
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("wandb not available. Install with: pip install wandb")
 
 
 
@@ -354,25 +360,181 @@ class DiffusionTrainingModule(torch.nn.Module):
 
 
 class ModelLogger:
-    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, use_wandb=False, accelerator=None, 
+                 save_every_n_epochs=1, validate_every_n_epochs=None, validation_config=None, validation_dataset=None):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.accelerator = accelerator
+        self.step_count = 0
+        self.save_every_n_epochs = save_every_n_epochs
+        self.validate_every_n_epochs = validate_every_n_epochs
+        self.validation_config = validation_config or {}
+        self.validation_dataset = validation_dataset
+        
+        if self.use_wandb and not WANDB_AVAILABLE:
+            print("Warning: wandb logging requested but wandb is not installed. Skipping wandb logging.")
+            self.use_wandb = False
         
     
     def on_step_end(self, loss):
-        pass
+        self.step_count += 1
+        if self.use_wandb and (self.accelerator is None or self.accelerator.is_main_process):
+            # Convert loss to float if it's a tensor
+            loss_value = loss.item() if hasattr(loss, 'item') else float(loss)
+            wandb.log({
+                "train/loss": loss_value,
+                "train/step": self.step_count
+            })
+    
+    
+    def should_save_checkpoint(self, epoch_id):
+        """Check if we should save checkpoint for this epoch"""
+        return (epoch_id + 1) % self.save_every_n_epochs == 0
+    
+    
+    def should_validate(self, epoch_id):
+        """Check if we should run validation for this epoch"""
+        return (self.validate_every_n_epochs is not None and 
+                (epoch_id + 1) % self.validate_every_n_epochs == 0)
+    
+    
+    def run_validation(self, model, epoch_id):
+        """Run validation and generate a video"""
+        if not self.should_validate(epoch_id):
+            return
+            
+        if self.accelerator is None or not self.accelerator.is_main_process:
+            return
+            
+        try:
+            print(f"Running validation for epoch {epoch_id + 1}...")
+            
+            # Get validation pipeline from the model
+            if hasattr(model, 'pipe'):
+                pipe = model.pipe
+            elif hasattr(self.accelerator.unwrap_model(model), 'pipe'):
+                pipe = self.accelerator.unwrap_model(model).pipe
+            else:
+                print("Warning: Could not find pipeline for validation")
+                return
+            
+            # Generate validation video
+            validation_video_path = os.path.join(self.output_path, f"validation_epoch_{epoch_id + 1}.mp4")
+            
+            # Use validation config with defaults
+            prompt = self.validation_config.get('prompt', 'a beautiful landscape')
+            negative_prompt = self.validation_config.get('negative_prompt', '')
+            num_frames = self.validation_config.get('num_frames', 49)
+            height = self.validation_config.get('height', 480)
+            width = self.validation_config.get('width', 832)
+            seed = self.validation_config.get('seed', 42)
+            
+            # If validation dataset is provided, use it for validation video generation
+            if self.validation_dataset is not None and len(self.validation_dataset) > 0:
+                # Use first item from validation dataset
+                val_data = self.validation_dataset[0]
+                
+                # Use validation data if available, otherwise fall back to config
+                if 'video' in val_data:
+                    vace_video = val_data['video'][:num_frames]  # Limit to num_frames
+                    if 'vace_video' in val_data:
+                        reference_image = val_data['vace_video'][0] if val_data['vace_video'] else None
+                    else:
+                        reference_image = vace_video[0] if vace_video else None
+                else:
+                    vace_video = None
+                    reference_image = None
+                
+                # Use prompt from validation data if available
+                if 'prompt' in val_data:
+                    prompt = val_data['prompt']
+                    
+                print(f"Using validation dataset for validation video generation")
+            else:
+                vace_video = None
+                reference_image = None
+                print(f"Using config-based prompt for validation video generation")
+            
+            with torch.no_grad():
+                if vace_video is not None and reference_image is not None:
+                    # Use validation data
+                    video = pipe(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        vace_video=vace_video,
+                        vace_reference_image=reference_image,
+                        num_frames=num_frames,
+                        height=height,
+                        width=width,
+                        seed=seed,
+                        tiled=True
+                    )
+                else:
+                    # Use prompt-only generation
+                    video = pipe(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        num_frames=num_frames,
+                        height=height,
+                        width=width,
+                        seed=seed,
+                        tiled=True
+                    )
+            
+            # Save video locally
+            from diffsynth import save_video
+            save_video(video, validation_video_path, fps=15, quality=5)
+            print(f"Validation video saved to: {validation_video_path}")
+            
+            # Log to wandb if enabled
+            if self.use_wandb:
+                wandb.log({
+                    "validation/epoch": epoch_id + 1,
+                    "validation/video": wandb.Video(validation_video_path, fps=15, format="mp4"),
+                    "validation/prompt": prompt,
+                    "validation/source": "dataset" if vace_video is not None else "prompt"
+                })
+                print(f"Validation video logged to wandb")
+                
+        except Exception as e:
+            print(f"Warning: Validation failed for epoch {epoch_id + 1}: {e}")
+            import traceback
+            traceback.print_exc()
     
     
     def on_epoch_end(self, accelerator, model, epoch_id):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            state_dict = accelerator.get_state_dict(model)
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
-            state_dict = self.state_dict_converter(state_dict)
-            os.makedirs(self.output_path, exist_ok=True)
-            path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
-            accelerator.save(state_dict, path, safe_serialization=True)
+            # Save checkpoint only if needed
+            if self.should_save_checkpoint(epoch_id):
+                state_dict = accelerator.get_state_dict(model)
+                state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+                state_dict = self.state_dict_converter(state_dict)
+                os.makedirs(self.output_path, exist_ok=True)
+                path = os.path.join(self.output_path, f"epoch-{epoch_id + 1}.safetensors")
+                accelerator.save(state_dict, path, safe_serialization=True)
+                print(f"Checkpoint saved: {path}")
+                
+                # Log epoch completion to wandb
+                if self.use_wandb:
+                    wandb.log({
+                        "train/epoch": epoch_id + 1,
+                        "train/checkpoint_saved": path
+                    })
+            else:
+                print(f"Skipping checkpoint save for epoch {epoch_id + 1} (save_every_n_epochs={self.save_every_n_epochs})")
+        
+        # Run validation if needed (after checkpoint saving)
+        self.run_validation(model, epoch_id)
+        
+        if self.should_validate(epoch_id):
+            accelerator.wait_for_everyone()
+            if hasattr(accelerator.unwrap_model(model), 'pipe'):
+                pipe = accelerator.unwrap_model(model).pipe
+                pipe.scheduler.set_timesteps(1000, training=True)
+                print("Scheduler reset to training mode.")
 
 
 
@@ -388,6 +550,9 @@ def launch_training_task(
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0])
     accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps)
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    
+    # Set accelerator reference in model_logger for wandb logging
+    model_logger.accelerator = accelerator
     
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
@@ -440,6 +605,22 @@ def wan_parser():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
+    # Wandb arguments
+    parser.add_argument("--use_wandb", default=False, action="store_true", help="Whether to use wandb for logging.")
+    parser.add_argument("--wandb_project", type=str, default="diffsynth-training", help="Wandb project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name. If None, wandb will auto-generate.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (team name).")
+    # Validation and checkpoint saving arguments
+    parser.add_argument("--save_every_n_epochs", type=int, default=1, help="Save checkpoint every N epochs (default: 1, save every epoch).")
+    parser.add_argument("--validate_every_n_epochs", type=int, default=None, help="Run validation every N epochs. If None, no validation is performed.")
+    parser.add_argument("--validation_dataset_base_path", type=str, default=None, help="Base path of the validation dataset. If None, uses training dataset for validation.")
+    parser.add_argument("--validation_dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the validation dataset.")
+    parser.add_argument("--validation_prompt", type=str, default="a beautiful landscape", help="Prompt for validation video generation.")
+    parser.add_argument("--validation_negative_prompt", type=str, default="", help="Negative prompt for validation video generation.")
+    parser.add_argument("--validation_num_frames", type=int, default=49, help="Number of frames for validation video.")
+    parser.add_argument("--validation_height", type=int, default=480, help="Height for validation video.")
+    parser.add_argument("--validation_width", type=int, default=832, help="Width for validation video.")
+    parser.add_argument("--validation_seed", type=int, default=42, help="Seed for validation video generation.")
     return parser
 
 
@@ -468,4 +649,19 @@ def flux_parser():
     parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
+    # Wandb arguments
+    parser.add_argument("--use_wandb", default=False, action="store_true", help="Whether to use wandb for logging.")
+    parser.add_argument("--wandb_project", type=str, default="diffsynth-training", help="Wandb project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb run name. If None, wandb will auto-generate.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (team name).")
+    # Validation and checkpoint saving arguments
+    parser.add_argument("--save_every_n_epochs", type=int, default=1, help="Save checkpoint every N epochs (default: 1, save every epoch).")
+    parser.add_argument("--validate_every_n_epochs", type=int, default=None, help="Run validation every N epochs. If None, no validation is performed.")
+    parser.add_argument("--validation_dataset_base_path", type=str, default=None, help="Base path of the validation dataset. If None, uses training dataset for validation.")
+    parser.add_argument("--validation_dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the validation dataset.")
+    parser.add_argument("--validation_prompt", type=str, default="a beautiful landscape", help="Prompt for validation image generation.")
+    parser.add_argument("--validation_negative_prompt", type=str, default="", help="Negative prompt for validation image generation.")
+    parser.add_argument("--validation_height", type=int, default=1024, help="Height for validation image.")
+    parser.add_argument("--validation_width", type=int, default=1024, help="Width for validation image.")
+    parser.add_argument("--validation_seed", type=int, default=42, help="Seed for validation image generation.")
     return parser

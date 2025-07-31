@@ -1,7 +1,13 @@
-import torch, os, json
+import torch, os, json, argparse
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, VideoDataset, ModelLogger, launch_training_task, wan_parser
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 
@@ -107,7 +113,54 @@ class WanTrainingModule(DiffusionTrainingModule):
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+    
+    # Initialize wandb if enabled
+    if args.use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            config={
+                "learning_rate": args.learning_rate,
+                "num_epochs": args.num_epochs,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "lora_rank": args.lora_rank,
+                "num_frames": args.num_frames,
+                "dataset_base_path": args.dataset_base_path,
+                "trainable_models": args.trainable_models,
+                "lora_base_model": args.lora_base_model,
+                "lora_target_modules": args.lora_target_modules,
+                "save_every_n_epochs": args.save_every_n_epochs,
+                "validate_every_n_epochs": args.validate_every_n_epochs,
+                "validation_prompt": args.validation_prompt,
+            }
+        )
+        print(f"Wandb initialized. Project: {args.wandb_project}, Run: {wandb.run.name}")
+    elif args.use_wandb and not WANDB_AVAILABLE:
+        print("Warning: wandb logging requested but wandb is not installed. Install with: pip install wandb")
+    
     dataset = VideoDataset(args=args)
+    
+    # Create validation dataset if validation path is provided
+    validation_dataset = None
+    if args.validate_every_n_epochs and args.validation_dataset_base_path:
+        print(f"Loading validation dataset from: {args.validation_dataset_base_path}")
+        
+        # Create validation args based on training args but with validation paths
+        validation_args = argparse.Namespace(**vars(args))
+        validation_args.dataset_base_path = args.validation_dataset_base_path
+        validation_args.dataset_metadata_path = args.validation_dataset_metadata_path
+        
+        try:
+            validation_dataset = VideoDataset(args=validation_args)
+            print(f"Validation dataset loaded with {len(validation_dataset)} samples")
+        except Exception as e:
+            print(f"Warning: Failed to load validation dataset: {e}")
+            print("Validation will use prompt-based generation instead")
+            validation_dataset = None
+    elif args.validate_every_n_epochs:
+        print("Validation enabled but no validation dataset path provided. Using prompt-based validation.")
+    
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -120,15 +173,40 @@ if __name__ == "__main__":
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
     )
+    
+    # Prepare validation config
+    validation_config = {
+        'prompt': args.validation_prompt,
+        'negative_prompt': args.validation_negative_prompt,
+        'num_frames': args.validation_num_frames,
+        'height': args.validation_height,
+        'width': args.validation_width,
+        'seed': args.validation_seed,
+    }
+    
     model_logger = ModelLogger(
         args.output_path,
-        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        use_wandb=args.use_wandb,
+        save_every_n_epochs=args.save_every_n_epochs,
+        validate_every_n_epochs=args.validate_every_n_epochs,
+        validation_config=validation_config,
+        validation_dataset=validation_dataset
     )
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    
     print(f"Starting training with {len(dataset)} samples.")
+    if args.validate_every_n_epochs:
+        print(f"Validation will run every {args.validate_every_n_epochs} epochs")
+    print(f"Checkpoints will be saved every {args.save_every_n_epochs} epochs")
+    
     launch_training_task(
         dataset, model, model_logger, optimizer, scheduler,
         num_epochs=args.num_epochs,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
+    
+    # Finish wandb run
+    if args.use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
